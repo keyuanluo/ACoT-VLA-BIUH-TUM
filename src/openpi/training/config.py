@@ -1583,7 +1583,7 @@ _CONFIGS = [
     # action cot related configs
     TrainConfig(
         name="acot_libero_action_cot_explicit_implicit_co_fusion",
-        model=acot_vla.ACOTConfig(coarse_action_horizon=15, action_horizon=10, pi05=True, discrete_state_input=False, coarse_action_expert_variant = "gemma_300m", action_expert_variant = "gemma_300m", adopt_explicit_action_reasoner=True, adopt_implicit_action_reasoner=True, downsample_based_implicit_extractor=True),
+        model=acot_vla.ACOTConfig(coarse_action_horizon=15, action_horizon=10, pi05=True, discrete_state_input=False, coarse_action_expert_variant = "gemma_300m", action_expert_variant = "gemma_300m", adopt_explicit_action_reasoner=True, adopt_implicit_action_reasoner=True, downsample_based_implicit_extractor=True, adopt_bar=True, bar_block_size=3),
         data=LeRobotACOTLiberoDataConfig(
             repo_id="/mnt/public/zhonglinqing/data/datasets/libero_dataset/",
             base_config=DataConfig(prompt_from_task=True),
