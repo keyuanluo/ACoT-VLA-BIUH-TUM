@@ -380,6 +380,8 @@ class ACOT_VLA(_model.BaseModel):
     def __init__(self, config: ACOTConfig, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.log_sigma_ref = nnx.Param(jnp.zeros(()))  # EAR 任务不确定性
+        self.log_sigma_expert = nnx.Param(jnp.zeros(()))  # 主模型任务不确定性
 
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         coarse_action_expert_config = _gemma.get_config(config.coarse_action_expert_variant)
@@ -781,20 +783,37 @@ class ACOT_VLA(_model.BaseModel):
         )
 
 
+        # if self.adopt_explicit_action_reasoner:
+        #     # trainer explicit action reasoner using flow matching
+        #     v_ref_t = self.coarse_action_out_proj(suffix_ref_action_out[:, -self.coarse_action_horizon :])
+        #     v_expert_t = self.action_out_proj(suffix_expert_out[:, -self.action_horizon :])
+        #
+        #     action_diff_ref = u_ref_t - v_ref_t
+        #     action_diff_expert = u_expert_t - v_expert_t
+        #     # Since we set the balance factor as 0.5, the following loss is equal
+        #     return jnp.mean(jnp.square(action_diff_ref)) + jnp.mean(jnp.square(action_diff_expert))
+        #
+        # else:
+        #     v_expert_t = self.action_out_proj(suffix_expert_out[:, -self.action_horizon :])
+        #     action_diff_expert = u_expert_t - v_expert_t
+        #     return jnp.mean(jnp.square(action_diff_expert))
+
         if self.adopt_explicit_action_reasoner:
-            # trainer explicit action reasoner using flow matching
-            v_ref_t = self.coarse_action_out_proj(suffix_ref_action_out[:, -self.coarse_action_horizon :])
-            v_expert_t = self.action_out_proj(suffix_expert_out[:, -self.action_horizon :])
+            v_ref_t = self.coarse_action_out_proj(suffix_ref_action_out[:, -self.coarse_action_horizon:])
+            v_expert_t = self.action_out_proj(suffix_expert_out[:, -self.action_horizon:])
+            l_ref = jnp.mean(jnp.square(u_ref_t - v_ref_t))
+            l_expert = jnp.mean(jnp.square(u_expert_t - v_expert_t))
 
-            action_diff_ref = u_ref_t - v_ref_t
-            action_diff_expert = u_expert_t - v_expert_t
-            # Since we set the balance factor as 0.5, the following loss is equal
-            return jnp.mean(jnp.square(action_diff_ref)) + jnp.mean(jnp.square(action_diff_expert))
-
+            # Kendall uncertainty weighting
+            sigma_ref = jnp.exp(self.log_sigma_ref.value)
+            sigma_expert = jnp.exp(self.log_sigma_expert.value)
+            loss = (l_ref / (2 * sigma_ref ** 2) + jnp.log(sigma_ref) +
+                    l_expert / (2 * sigma_expert ** 2) + jnp.log(sigma_expert))
+            return loss
         else:
-            v_expert_t = self.action_out_proj(suffix_expert_out[:, -self.action_horizon :])
-            action_diff_expert = u_expert_t - v_expert_t
-            return jnp.mean(jnp.square(action_diff_expert))
+            v_expert_t = self.action_out_proj(suffix_expert_out[:, -self.action_horizon:])
+            l_expert = jnp.mean(jnp.square(u_expert_t - v_expert_t))
+            return l_expert
 
     @override
     def sample_actions(
