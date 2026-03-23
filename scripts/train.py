@@ -190,6 +190,63 @@ def train_step(
     }
     return new_state, info
 
+# @at.typecheck
+# def acot_train_step(
+#     config: _config.TrainConfig,
+#     rng: at.KeyArrayLike,
+#     state: training_utils.TrainState,
+#     batch: tuple[_model.Observation, _model.Actions, _model.CoarseActions],
+# ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
+#     model = nnx.merge(state.model_def, state.params)
+#     model.train()
+#
+#     @at.typecheck
+#     def loss_fn(
+#         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions,
+#         coarse_actions: _model.CoarseActions
+#     ):
+#         return model.compute_loss(rng, observation, actions, coarse_actions, train=True)
+#
+#     train_rng = jax.random.fold_in(rng, state.step)
+#     observation, actions, coarse_actions = batch
+#
+#     # Filter out frozen params.
+#     diff_state = nnx.DiffState(0, config.trainable_filter)
+#     loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions, coarse_actions)
+#
+#     params = state.params.filter(config.trainable_filter)
+#     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
+#     new_params = optax.apply_updates(params, updates)
+#
+#     # Update the model in place and return the new full state.
+#     nnx.update(model, new_params)
+#     new_params = nnx.state(model)
+#
+#     new_state = dataclasses.replace(state, step=state.step + 1, params=new_params, opt_state=new_opt_state)
+#     if state.ema_decay is not None:
+#         new_state = dataclasses.replace(
+#             new_state,
+#             ema_params=jax.tree.map(
+#                 lambda old, new: state.ema_decay * old + (1 - state.ema_decay) * new, state.ema_params, new_params
+#             ),
+#         )
+#
+#     # Filter out params that aren't kernels.
+#     kernel_params = nnx.state(
+#         model,
+#         nnx.All(
+#             nnx.Param,
+#             nnx.Not(nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")),
+#             lambda _, x: x.value.ndim > 1,
+#         ),
+#     )
+#     info = {
+#         "loss": loss,
+#         "grad_norm": optax.global_norm(grads),
+#         "param_norm": optax.global_norm(kernel_params),
+#     }
+#     return new_state, info
+
 @at.typecheck
 def acot_train_step(
     config: _config.TrainConfig,
@@ -202,7 +259,8 @@ def acot_train_step(
 
     @at.typecheck
     def loss_fn(
-        model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions,
+        model: _model.BaseModel, rng: at.KeyArrayLike,
+        observation: _model.Observation, actions: _model.Actions,
         coarse_actions: _model.CoarseActions
     ):
         return model.compute_loss(rng, observation, actions, coarse_actions, train=True)
@@ -210,28 +268,25 @@ def acot_train_step(
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions, coarse_actions = batch
 
-    # Filter out frozen params.
     diff_state = nnx.DiffState(0, config.trainable_filter)
-    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions, coarse_actions)
+    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(
+        model, train_rng, observation, actions, coarse_actions
+    )
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
     new_params = optax.apply_updates(params, updates)
-
-    # Update the model in place and return the new full state.
     nnx.update(model, new_params)
     new_params = nnx.state(model)
 
-    new_state = dataclasses.replace(state, step=state.step + 1, params=new_params, opt_state=new_opt_state)
-    if state.ema_decay is not None:
-        new_state = dataclasses.replace(
-            new_state,
-            ema_params=jax.tree.map(
-                lambda old, new: state.ema_decay * old + (1 - state.ema_decay) * new, state.ema_params, new_params
-            ),
-        )
+    new_state = dataclasses.replace(
+        state, step=state.step + 1, params=new_params, opt_state=new_opt_state
+    )
 
-    # Filter out params that aren't kernels.
+    # 记录当前的自适应权重（方便 wandb 监控）
+    sigma_ref = jnp.exp(model.log_sigma_ref.value)
+    sigma_expert = jnp.exp(model.log_sigma_expert.value)
+
     kernel_params = nnx.state(
         model,
         nnx.All(
@@ -242,6 +297,10 @@ def acot_train_step(
     )
     info = {
         "loss": loss,
+        "sigma_ref": sigma_ref,          # EAR 的不确定性
+        "sigma_expert": sigma_expert,     # 主模型的不确定性
+        "weight_ref": 1.0 / (2 * sigma_ref**2),    # 等效权重
+        "weight_expert": 1.0 / (2 * sigma_expert**2),
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
