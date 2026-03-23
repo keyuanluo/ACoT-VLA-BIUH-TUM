@@ -286,6 +286,9 @@ class ACOTConfig(_model.BaseModelConfig):
     attention_pooling_implicit_extractor: bool = False  # type: ignore
     downsample_based_implicit_extractor: bool = False  # type: ignore
 
+    adopt_bar: bool = False      # 新增开关
+    bar_block_size: int = 2      # 新增：block大
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
@@ -387,6 +390,8 @@ class ACOT_VLA(_model.BaseModel):
                 configs=[paligemma_config, coarse_action_expert_config, action_expert_config],
                 embed_dtype=config.dtype,
                 adarms=self.pi05,
+                adopt_bar=config.adopt_bar,  # ← 新增
+                block_size=config.bar_block_size,  # ← 新增
             )
         )
         llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True, True] if self.pi05 else [False, False, False])
