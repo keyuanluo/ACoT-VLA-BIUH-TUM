@@ -114,10 +114,17 @@ def restore_state(
 
 
 def load_norm_stats(assets_dir: epath.Path | str, asset_id: str) -> dict[str, _normalize.NormStats] | None:
-    if "/" in asset_id or isinstance(asset_id, list):
-        norm_stats_dir = epath.Path(assets_dir)
+    assets_dir = epath.Path(assets_dir)
+    if isinstance(asset_id, list):
+        norm_stats_dir = assets_dir
     else:
-        norm_stats_dir = epath.Path(assets_dir) / asset_id
+        # Newer local-data checkpoints save norm stats directly under `assets/`,
+        # while older checkpoints keep them under `assets/<asset_id>/`.
+        candidate_dir = assets_dir / asset_id
+        if (candidate_dir / "norm_stats.json").exists():
+            norm_stats_dir = candidate_dir
+        else:
+            norm_stats_dir = assets_dir
     norm_stats = _normalize.load(norm_stats_dir)
     logging.info(f"Loaded norm stats from {norm_stats_dir}")
     return norm_stats

@@ -15,6 +15,7 @@ import openpi.models.siglip as _siglip
 from openpi.models.pi0 import posemb_sincos, make_attn_mask
 from openpi.shared import array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
+from openpi.shared import image_tools
 
 logger = logging.getLogger("ACoT_VLA")
 
@@ -263,6 +264,173 @@ class UnifiedAttentionModule(nnx.Module):
         return output
 
 
+class DepthTransformerBlock(nnx.Module):
+    def __init__(
+        self,
+        dim: int,
+        mlp_dim: int,
+        num_heads: int,
+        *,
+        rngs: nnx.Rngs,
+        param_dtype=jnp.float32,
+    ):
+        self.norm1 = nnx.LayerNorm(dim, rngs=rngs, param_dtype=param_dtype)
+        self.attn = nnx.MultiHeadAttention(in_features=dim, num_heads=num_heads, rngs=rngs, param_dtype=param_dtype)
+        self.norm2 = nnx.LayerNorm(dim, rngs=rngs, param_dtype=param_dtype)
+        self.mlp = MLP(dim, mlp_dim, dim, rngs=rngs, param_dtype=param_dtype)
+
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        y = self.norm1(x)
+        y = self.attn(y, y, y, decode=False)
+        x = x + y
+
+        y = self.norm2(x)
+        y = self.mlp(y)
+        return x + y
+
+
+class DepthTokenPooler(nnx.Module):
+    def __init__(
+        self,
+        num_queries: int,
+        dim: int,
+        *,
+        num_heads: int,
+        rngs: nnx.Rngs,
+        param_dtype=jnp.float32,
+    ):
+        self.num_queries = num_queries
+        self.dim = dim
+        self.query_tokens = nnx.Param(jax.random.normal(rngs.params(), (num_queries, dim), dtype=param_dtype) * 0.02)
+        self.cross_attn = UnifiedAttentionModule(
+            in_dim_1=dim,
+            in_dim_2=dim,
+            out_dim=dim,
+            hidden_dim=dim,
+            apply_sigmoid=False,
+            num_heads=num_heads,
+            rngs=rngs,
+            param_dtype=param_dtype,
+        )
+
+    def __call__(self, patch_tokens: jnp.ndarray) -> jnp.ndarray:
+        queries = jnp.broadcast_to(self.query_tokens[None, :, :], (patch_tokens.shape[0], self.num_queries, self.dim))
+        return self.cross_attn(queries, patch_tokens)
+
+
+class GatedCrossAttentionFusion(nnx.Module):
+    def __init__(self, dim: int, *, num_heads: int, rngs: nnx.Rngs, param_dtype=jnp.float32):
+        self.cross_attn = UnifiedAttentionModule(
+            in_dim_1=dim,
+            in_dim_2=dim,
+            out_dim=dim,
+            hidden_dim=dim,
+            apply_sigmoid=False,
+            num_heads=num_heads,
+            rngs=rngs,
+            param_dtype=param_dtype,
+        )
+        self.gate_proj = nnx.Linear(2 * dim, dim, rngs=rngs, param_dtype=param_dtype)
+
+    def __call__(self, target_tokens: jnp.ndarray, source_tokens: jnp.ndarray) -> jnp.ndarray:
+        attended = self.cross_attn(target_tokens, source_tokens)
+        gate = nnx.sigmoid(self.gate_proj(jnp.concatenate([target_tokens, attended], axis=-1)))
+        return target_tokens + gate * attended
+
+
+class DepthExpert(nnx.Module):
+    def __init__(
+        self,
+        *,
+        camera_names: Sequence[str],
+        patch_size: int,
+        embed_dim: int,
+        encoder_depth: int,
+        num_heads: int,
+        tokens_per_view: int,
+        reasoner_dim: int,
+        expert_dim: int,
+        rngs: nnx.Rngs,
+        param_dtype=jnp.float32,
+    ):
+        self.camera_names = tuple(camera_names)
+        self.patch_size = patch_size
+        self.embed_dim = embed_dim
+        self.tokens_per_view = tokens_per_view
+        self.patch_embed = nnx.Conv(
+            in_features=2,
+            out_features=embed_dim,
+            kernel_size=(patch_size, patch_size),
+            strides=(patch_size, patch_size),
+            padding="VALID",
+            rngs=rngs,
+            param_dtype=param_dtype,
+        )
+        self.encoder_blocks = [
+            DepthTransformerBlock(
+                dim=embed_dim,
+                mlp_dim=embed_dim * 4,
+                num_heads=num_heads,
+                rngs=rngs,
+                param_dtype=param_dtype,
+            )
+            for _ in range(encoder_depth)
+        ]
+        self.final_norm = nnx.LayerNorm(embed_dim, rngs=rngs, param_dtype=param_dtype)
+        self.pooler = DepthTokenPooler(
+            num_queries=tokens_per_view,
+            dim=embed_dim,
+            num_heads=num_heads,
+            rngs=rngs,
+            param_dtype=param_dtype,
+        )
+        self.depth_to_reasoner_proj = nnx.Linear(embed_dim, reasoner_dim, rngs=rngs, param_dtype=param_dtype)
+        self.depth_to_expert_proj = nnx.Linear(embed_dim, expert_dim, rngs=rngs, param_dtype=param_dtype)
+
+    def _prepare_single_view(self, depth_image: jnp.ndarray) -> jnp.ndarray:
+        depth_image = jnp.asarray(depth_image, dtype=jnp.float32)
+        if depth_image.shape[1:3] != _model.IMAGE_RESOLUTION:
+            depth_image = image_tools.resize_with_pad(depth_image, *_model.IMAGE_RESOLUTION)
+        depth_image = jnp.maximum(depth_image, 0.0)
+        valid_mask = (depth_image > 0).astype(jnp.float32)
+        depth_max = jnp.max(depth_image, axis=(1, 2, 3), keepdims=True)
+        depth_scale = jnp.where(depth_max > 255.0, 65535.0, jnp.where(depth_max > 1.5, 255.0, 1.0))
+        depth_image = depth_image / depth_scale
+        return jnp.concatenate([depth_image, valid_mask], axis=-1)
+
+    def _encode_single_view(self, depth_image: jnp.ndarray) -> jnp.ndarray:
+        x = self._prepare_single_view(depth_image)
+        x = self.patch_embed(x)
+        batch_size, patch_h, patch_w, dim = x.shape
+        x = x.reshape(batch_size, patch_h * patch_w, dim)
+        x = x + _siglip.posemb_sincos_2d(patch_h, patch_w, dim, dtype=jnp.float32)
+        for block in self.encoder_blocks:
+            x = block(x)
+        x = self.final_norm(x)
+        return self.pooler(x)
+
+    def __call__(
+        self, observation: _model.Observation
+    ) -> tuple[jnp.ndarray | None, jnp.ndarray | None]:
+        if observation.depth_images is None:
+            return None, None
+
+        per_view_tokens = []
+        for camera_name in self.camera_names:
+            if camera_name not in observation.depth_images:
+                raise ValueError(
+                    f"DepthExpert expected depth view '{camera_name}', got {list(observation.depth_images)}"
+                )
+            view_tokens = self._encode_single_view(observation.depth_images[camera_name])
+            if observation.depth_image_masks is not None and camera_name in observation.depth_image_masks:
+                view_mask = jnp.asarray(observation.depth_image_masks[camera_name], dtype=jnp.float32)
+                view_tokens = view_tokens * view_mask[:, None, None]
+            per_view_tokens.append(view_tokens)
+
+        depth_tokens = jnp.concatenate(per_view_tokens, axis=1)
+        return self.depth_to_reasoner_proj(depth_tokens), self.depth_to_expert_proj(depth_tokens)
+
+
 @dataclasses.dataclass(frozen=True)
 class ACOTConfig(_model.BaseModelConfig):
     dtype: str = "bfloat16"
@@ -286,6 +454,13 @@ class ACOTConfig(_model.BaseModelConfig):
     attention_pooling_implicit_extractor: bool = False  # type: ignore
     downsample_based_implicit_extractor: bool = False  # type: ignore
 
+    use_depth: bool = False  # type: ignore
+    depth_patch_size: int = 14
+    depth_embed_dim: int = 256
+    depth_encoder_depth: int = 2
+    depth_num_heads: int = 4
+    depth_tokens_per_view: int = 4
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
@@ -308,19 +483,15 @@ class ACOTConfig(_model.BaseModelConfig):
     def inputs_spec(self, *, batch_size: int = 1) -> tuple[_model.Observation, _model.Actions]:
         image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 3], jnp.float32)
         image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
+        depth_image_spec = jax.ShapeDtypeStruct([batch_size, *_model.IMAGE_RESOLUTION, 1], jnp.float32)
+        depth_image_mask_spec = jax.ShapeDtypeStruct([batch_size], jnp.bool_)
 
         with at.disable_typechecking():
             observation_spec = _model.Observation(
-                images={
-                    "base_0_rgb": image_spec,
-                    "left_wrist_0_rgb": image_spec,
-                    "right_wrist_0_rgb": image_spec,
-                },
-                image_masks={
-                    "base_0_rgb": image_mask_spec,
-                    "left_wrist_0_rgb": image_mask_spec,
-                    "right_wrist_0_rgb": image_mask_spec,
-                },
+                images={key: image_spec for key in _model.IMAGE_KEYS},
+                image_masks={key: image_mask_spec for key in _model.IMAGE_KEYS},
+                depth_images={key: depth_image_spec for key in _model.DEPTH_IMAGE_KEYS},
+                depth_image_masks={key: depth_image_mask_spec for key in _model.DEPTH_IMAGE_KEYS},
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
@@ -377,6 +548,7 @@ class ACOT_VLA(_model.BaseModel):
     def __init__(self, config: ACOTConfig, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.use_depth = config.use_depth
 
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         coarse_action_expert_config = _gemma.get_config(config.coarse_action_expert_variant)
@@ -418,6 +590,29 @@ class ACOT_VLA(_model.BaseModel):
 
         self.coarse_action_out_proj = nnx.Linear(coarse_action_expert_config.width, config.action_dim, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
+
+        if self.use_depth:
+            self.depth_expert = DepthExpert(
+                camera_names=_model.DEPTH_IMAGE_KEYS,
+                patch_size=config.depth_patch_size,
+                embed_dim=config.depth_embed_dim,
+                encoder_depth=config.depth_encoder_depth,
+                num_heads=config.depth_num_heads,
+                tokens_per_view=config.depth_tokens_per_view,
+                reasoner_dim=coarse_action_expert_config.width,
+                expert_dim=action_expert_config.width,
+                rngs=rngs,
+            )
+            self.reasoner_depth_fusion = GatedCrossAttentionFusion(
+                coarse_action_expert_config.width, num_heads=config.depth_num_heads, rngs=rngs
+            )
+            self.expert_depth_fusion = GatedCrossAttentionFusion(
+                action_expert_config.width, num_heads=config.depth_num_heads, rngs=rngs
+            )
+        else:
+            self.depth_expert = None
+            self.reasoner_depth_fusion = None
+            self.expert_depth_fusion = None
         
         self.adopt_explicit_action_reasoner = config.adopt_explicit_action_reasoner
         if self.adopt_explicit_action_reasoner:
@@ -511,6 +706,13 @@ class ACOT_VLA(_model.BaseModel):
         self.deterministic = True
         self.coarse_action_horizon = config.coarse_action_horizon
 
+    def encode_depth(
+        self, observation: _model.Observation
+    ) -> tuple[jnp.ndarray | None, jnp.ndarray | None]:
+        if not self.use_depth or self.depth_expert is None:
+            return None, None
+        return self.depth_expert(observation)
+
 
     @at.typecheck
     def embed_prefix(
@@ -554,6 +756,7 @@ class ACOT_VLA(_model.BaseModel):
         timestep: at.Float[at.Array, " b"],
         explicit_action_reason: Optional[jax.Array] = None,
         implicit_action_reason: Optional[jax.Array] = None,
+        depth_tokens: Optional[jax.Array] = None,
         suf_type = "reasoner"
     ) -> tuple[
         at.Float[at.Array, "b s emb"],
@@ -594,6 +797,9 @@ class ACOT_VLA(_model.BaseModel):
                 action_time_tokens = self.coarse_action_time_mlp_out(action_time_tokens)
                 action_expert_tokens = action_time_tokens
                 adarms_cond = None
+
+            if depth_tokens is not None:
+                action_expert_tokens = self.reasoner_depth_fusion(action_expert_tokens, depth_tokens)
 
         elif suf_type == "expert":
             action_tokens = self.action_in_proj(noisy_actions)
@@ -670,6 +876,9 @@ class ACOT_VLA(_model.BaseModel):
                 # keep vanilla
                 pass
 
+            if depth_tokens is not None:
+                action_expert_tokens = self.expert_depth_fusion(action_expert_tokens, depth_tokens)
+
         else:
             raise ValueError(f"Unknown suffix type: {suf_type}")
 
@@ -702,6 +911,7 @@ class ACOT_VLA(_model.BaseModel):
         # preprocess_rng, _, time_rng, coarse_action_noise_rng, _, expert_action_noise_rng = jax.random.split(rng, 6)
         preprocess_rng, time_rng, coarse_action_noise_rng, expert_action_noise_rng = jax.random.split(rng, 4)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+        depth_reasoner_tokens, depth_expert_tokens = self.encode_depth(observation)
 
         batch_shape = actions.shape[:-2]
 
@@ -727,7 +937,9 @@ class ACOT_VLA(_model.BaseModel):
 
         if self.adopt_explicit_action_reasoner:
             # suffix forward to get explicit action reference
-            suffix_ref_action_tokens, suffix_ref_action_mask, suffix_ref_action_ar_mask, adarms_ref_action_cond = self.embed_suffix(observation, x_ref_t, time, suf_type = "reasoner")
+            suffix_ref_action_tokens, suffix_ref_action_mask, suffix_ref_action_ar_mask, adarms_ref_action_cond = self.embed_suffix(
+                observation, x_ref_t, time, depth_tokens=depth_reasoner_tokens, suf_type="reasoner"
+            )
 
             input_mask = jnp.concatenate([prefix_mask, suffix_ref_action_mask], axis=1)
             ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ref_action_ar_mask], axis=0)
@@ -760,6 +972,7 @@ class ACOT_VLA(_model.BaseModel):
             observation, x_expert_t, time,
             explicit_action_reason=explicit_action_reason,
             implicit_action_reason=implicit_action_reason,
+            depth_tokens=depth_expert_tokens,
             suf_type = "expert"
         )
 
@@ -800,6 +1013,7 @@ class ACOT_VLA(_model.BaseModel):
         num_steps: int | at.Int[at.Array, ""] = 10,
     ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
+        depth_reasoner_tokens, depth_expert_tokens = self.encode_depth(observation)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
         dt = -1.0 / num_steps
@@ -826,7 +1040,11 @@ class ACOT_VLA(_model.BaseModel):
         def step_explicit_action_reasoner(carry):
             x_t, time, step_idx = carry
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
-                observation, x_t, jnp.broadcast_to(time, batch_size), suf_type = "reasoner"
+                observation,
+                x_t,
+                jnp.broadcast_to(time, batch_size),
+                depth_tokens=depth_reasoner_tokens,
+                suf_type="reasoner",
             )
 
             suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
@@ -866,6 +1084,7 @@ class ACOT_VLA(_model.BaseModel):
                 observation, x_t, jnp.broadcast_to(time, batch_size),
                 explicit_action_reason=explicit_action_reason,
                 implicit_action_reason=implicit_action_reason,
+                depth_tokens=depth_expert_tokens,
                 suf_type = "expert"
             )
 

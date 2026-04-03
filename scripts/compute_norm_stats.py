@@ -5,6 +5,9 @@ will compute the mean and standard deviation of the data in the dataset and save
 to the config assets directory.
 """
 
+import dataclasses
+import pathlib
+
 import numpy as np
 import tqdm
 import tyro
@@ -86,8 +89,15 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None):
+def main(
+    config_name: str,
+    max_frames: int | None = None,
+    repo_id: str | None = None,
+    output_dir: str | None = None,
+):
     config = _config.get_config(config_name)
+    if repo_id is not None:
+        config = dataclasses.replace(config, data=dataclasses.replace(config.data, repo_id=repo_id))
     data_config = config.data.create(config.assets_dirs, config.model)
 
     if data_config.rlds_data_dir is not None:
@@ -128,7 +138,12 @@ def main(config_name: str, max_frames: int | None = None):
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    output_path = "./"
+    if output_dir is not None:
+        output_path = pathlib.Path(output_dir)
+    elif data_config.asset_id is not None and pathlib.Path(str(data_config.asset_id)).is_absolute():
+        output_path = pathlib.Path(str(data_config.asset_id))
+    else:
+        output_path = pathlib.Path("./")
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 

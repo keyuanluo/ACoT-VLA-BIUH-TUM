@@ -662,6 +662,77 @@ class LerobotACOTGo2DataConfig(DataConfigFactory):
         object.__setattr__(ret_config, 'joint_action_shifts', self.joint_action_shifts)
         return ret_config
 
+
+@dataclasses.dataclass(frozen=True)
+class LerobotGo2DataConfig(DataConfigFactory):
+    """
+    Configuration for the Go2 robot dataset using plain pi0/pi0.5 models.
+    This is useful for quick competition-data validation before switching to ACOT training.
+    """
+
+    use_delta_joint_actions: bool = True
+    default_prompt: str | None = None
+
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "top_head": "observation.images.top_head",
+                            "hand_left": "observation.images.hand_left",
+                            "hand_right": "observation.images.hand_right",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+    )
+
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    state_mask: Sequence[int] = dataclasses.field(
+        default_factory=lambda: _transforms.make_bool_mask(-14, 2, 4, -1, 11)
+    )
+    action_mask: Sequence[int] = dataclasses.field(
+        default_factory=lambda: _transforms.make_bool_mask(-16, 4, -1, 11)
+    )
+    delta_action_mask: Sequence[int] = dataclasses.field(
+        default_factory=lambda: _transforms.make_bool_mask(14, -18)
+    )
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[
+                go2_policy.Go2Inputs(
+                    action_dim=model_config.action_dim,
+                    state_mask=self.state_mask,
+                    action_mask=self.action_mask,
+                )
+            ],
+            outputs=[go2_policy.Go2Outputs()],
+        )
+
+        if self.use_delta_joint_actions:
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(self.delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(self.delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
 @dataclasses.dataclass(frozen=True)
 class LeRobotACOTLiberoDataConfig(DataConfigFactory):
 
@@ -1190,6 +1261,12 @@ class TrainConfig:
 
     # How often (in steps) to log training metrics.
     log_interval: int = 100
+    # Hold out this fraction of training frames as a validation split. Set to 0 to disable validation.
+    val_split_ratio: float = 0.0
+    # How often (in steps) to run validation. Set to 0 to disable periodic validation.
+    val_interval: int = 0
+    # If provided, cap each validation pass to this many batches instead of sweeping the full validation split.
+    val_num_batches: int | None = None
     # How often (in steps) to save checkpoints.
     save_interval: int = 1000
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
@@ -1607,6 +1684,51 @@ _CONFIGS = [
         batch_size=128 if not os.getenv("DEBUG_MODE", default=False) == "true" else 1,
         freeze_filter=acot_vla.ACOTConfig().get_freeze_filter(freeze_vision = False, freeze_llm = True, freeze_dual_ae=[False, False]),
     ),
+    TrainConfig(
+        name="acot_libero_action_cot_explicit_implicit_co_fusion_local_pi05libero",
+        model=acot_vla.ACOTConfig(
+            coarse_action_horizon=15,
+            action_horizon=10,
+            pi05=True,
+            discrete_state_input=False,
+            coarse_action_expert_variant="gemma_300m",
+            action_expert_variant="gemma_300m",
+            adopt_explicit_action_reasoner=True,
+            adopt_implicit_action_reasoner=True,
+            downsample_based_implicit_extractor=True,
+        ),
+        data=LeRobotACOTLiberoDataConfig(
+            repo_id="/storage/nobackup/yiduo/hf_lerobot/your_hf_username/libero",
+            assets=AssetsConfig(
+                assets_dir="/storage/nobackup/yiduo/hf_lerobot/your_hf_username",
+                asset_id="libero",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=(False, False),
+            joint_action_shifts=(2, 1),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.ACOTCheckpointWeightLoader(
+            "/storage/nobackup/yiduo/openpi_cache/openpi-assets/checkpoints/pi05_libero/pi05_libero/params"
+        ),
+        checkpoint_base_dir="/storage/nobackup/yiduo/acotvla_checkpoints",
+        num_train_steps=51_000,
+        save_interval=10_000 if not os.getenv("DEBUG_MODE", default=False) == "true" else 1_000,
+        num_workers=48 if not os.getenv("DEBUG_MODE", default=False) == "true" else 1,
+        batch_size=128 if not os.getenv("DEBUG_MODE", default=False) == "true" else 1,
+        freeze_filter=acot_vla.ACOTConfig().get_freeze_filter(
+            freeze_vision=False,
+            freeze_llm=True,
+            freeze_dual_ae=[False, False],
+        ),
+    ),
     # VLABench configs
     TrainConfig(
         name="acot_vlabench_action_cot_explicit_implicit_co_fusion",
@@ -1811,6 +1933,221 @@ _CONFIGS = [
         num_workers=48 if not os.getenv("DEBUG_MODE", default=False) == "true" else 1,
         batch_size=128 if not os.getenv("DEBUG_MODE", default=False) == "true" else 16,
         freeze_filter=acot_vla.ACOTConfig().get_freeze_filter(freeze_vision = False, freeze_llm = True, freeze_dual_ae=[False, False]),
+    ),
+    # genie sim 3.0 local ACoT smoke configs
+    TrainConfig(
+        name="acot_icra_simulation_challenge_reasoning_to_action_clean_pi05_base_smoke",
+        model=acot_vla.ACOTConfig(
+            coarse_action_horizon=30,
+            action_horizon=30,
+            paligemma_variant="gemma_2b_lora",
+            adopt_explicit_action_reasoner=True,
+            adopt_implicit_action_reasoner=True,
+            downsample_based_implicit_extractor=True,
+            use_depth=True,
+        ),
+        data=LerobotACOTGo2DataConfig(
+            default_prompt=(
+                "Pick up the pen on the left side and place it into the pen holder, "
+                "close the laptop, pick up the tissue on the table and place it into the trash bin on the right side. "
+                "Then, pick up the mouse and place it on the right side of the laptop. "
+                "Finally, straighten the colored pencil box"
+            ),
+            repo_id="/storage/nobackup/yiduo/agibot_challenge_2026/Reasoning2Action-Sim/clean_the_desktop_addition",
+            assets=AssetsConfig(
+                assets_dir=None,
+                asset_id="/storage/home/yiduo/ACoT-VLA-depth/assets/competition/clean_the_desktop_addition",
+            ),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "top_head": "observation.images.top_head",
+                                "hand_left": "observation.images.hand_left",
+                                "hand_right": "observation.images.hand_right",
+                            },
+                            "depth_images": {
+                                "top_head": "observation.images.head_depth",
+                                "hand_left": "observation.images.hand_left_depth",
+                                "hand_right": "observation.images.hand_right_depth",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                            "task": "task",
+                            "episode_index": "episode_index",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+            joint_action_shifts=(2, 1),
+            extra_delta_transform=(True, True),
+            delta_action_mask=_transforms.make_bool_mask(14, -18),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.ACOTCheckpointWeightLoader(
+            "/storage/nobackup/yiduo/openpi_cache/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=1,
+        save_interval=1,
+        num_workers=1,
+        batch_size=1,
+        freeze_filter=acot_vla.ACOTConfig(paligemma_variant="gemma_2b_lora").get_freeze_filter(
+            freeze_vision=False, freeze_llm=True, freeze_llm_embedder=True, freeze_dual_ae=[False, False]
+        ),
+    ),
+    TrainConfig(
+        name="acot_icra_simulation_challenge_reasoning_to_action_clean_pi05_libero_smoke",
+        model=acot_vla.ACOTConfig(
+            coarse_action_horizon=30,
+            action_horizon=30,
+            paligemma_variant="gemma_2b_lora",
+            adopt_explicit_action_reasoner=True,
+            adopt_implicit_action_reasoner=True,
+            downsample_based_implicit_extractor=True,
+            use_depth=True,
+        ),
+        data=LerobotACOTGo2DataConfig(
+            default_prompt=(
+                "Pick up the pen on the left side and place it into the pen holder, "
+                "close the laptop, pick up the tissue on the table and place it into the trash bin on the right side. "
+                "Then, pick up the mouse and place it on the right side of the laptop. "
+                "Finally, straighten the colored pencil box"
+            ),
+            repo_id="/storage/nobackup/yiduo/agibot_challenge_2026/Reasoning2Action-Sim/clean_the_desktop_addition",
+            assets=AssetsConfig(
+                assets_dir=None,
+                asset_id="/storage/home/yiduo/ACoT-VLA-depth/assets/competition/clean_the_desktop_addition",
+            ),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "top_head": "observation.images.top_head",
+                                "hand_left": "observation.images.hand_left",
+                                "hand_right": "observation.images.hand_right",
+                            },
+                            "depth_images": {
+                                "top_head": "observation.images.head_depth",
+                                "hand_left": "observation.images.hand_left_depth",
+                                "hand_right": "observation.images.hand_right_depth",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                            "task": "task",
+                            "episode_index": "episode_index",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+            joint_action_shifts=(2, 1),
+            extra_delta_transform=(True, True),
+            delta_action_mask=_transforms.make_bool_mask(14, -18),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.ACOTCheckpointWeightLoader(
+            "/storage/nobackup/yiduo/openpi_cache/openpi-assets/checkpoints/pi05_libero/pi05_libero/params"
+        ),
+        num_train_steps=1,
+        save_interval=1,
+        num_workers=1,
+        batch_size=1,
+        freeze_filter=acot_vla.ACOTConfig(paligemma_variant="gemma_2b_lora").get_freeze_filter(
+            freeze_vision=False, freeze_llm=True, freeze_llm_embedder=True, freeze_dual_ae=[False, False]
+        ),
+    ),
+    TrainConfig(
+        name="acot_icra_simulation_challenge_reasoning_to_action_clean_depth_pi05libero_continue_45000",
+        model=acot_vla.ACOTConfig(
+            coarse_action_horizon=30,
+            action_horizon=30,
+            paligemma_variant="gemma_2b_lora",
+            adopt_explicit_action_reasoner=True,
+            adopt_implicit_action_reasoner=True,
+            downsample_based_implicit_extractor=True,
+            use_depth=True,
+            depth_tokens_per_view=4,
+        ),
+        data=LerobotACOTGo2DataConfig(
+            default_prompt=(
+                "Pick up the pen on the left side and place it into the pen holder, "
+                "close the laptop, pick up the tissue on the table and place it into the trash bin on the right side. "
+                "Then, pick up the mouse and place it on the right side of the laptop. "
+                "Finally, straighten the colored pencil box"
+            ),
+            repo_id="/storage/nobackup/yiduo/agibot_challenge_2026/Reasoning2Action-Sim/clean_the_desktop_addition",
+            assets=AssetsConfig(
+                assets_dir=None,
+                asset_id="/storage/home/yiduo/ACoT-VLA-depth/assets/competition/clean_the_desktop_addition",
+            ),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "top_head": "observation.images.top_head",
+                                "hand_left": "observation.images.hand_left",
+                                "hand_right": "observation.images.hand_right",
+                            },
+                            "depth_images": {
+                                "top_head": "observation.images.head_depth",
+                                "hand_left": "observation.images.hand_left_depth",
+                                "hand_right": "observation.images.hand_right_depth",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "prompt": "prompt",
+                            "task": "task",
+                            "episode_index": "episode_index",
+                        }
+                    )
+                ]
+            ),
+            base_config=DataConfig(dataloader_sampler="subtask", prompt_from_hl_instruction=True),
+            joint_action_shifts=(2, 1),
+            extra_delta_transform=(True, True),
+            delta_action_mask=_transforms.make_bool_mask(14, -18),
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.ACOTCheckpointWeightLoader(
+            "/storage/nobackup/yiduo/acotvla_without_depth_checkpoints/"
+            "acot_icra_simulation_challenge_reasoning_to_action_without_depth_local_pi05_libero/"
+            "without_depth_pi05libero_h200x1_bs24_long/45000/params"
+        ),
+        checkpoint_base_dir="/storage/nobackup/yiduo/acotvla_depth_checkpoints",
+        num_train_steps=50_000,
+        save_interval=5_000 if not os.getenv("DEBUG_MODE", default=False) == "true" else 1,
+        num_workers=8 if not os.getenv("DEBUG_MODE", default=False) == "true" else 1,
+        batch_size=24 if not os.getenv("DEBUG_MODE", default=False) == "true" else 1,
+        freeze_filter=acot_vla.ACOTConfig(paligemma_variant="gemma_2b_lora", use_depth=True).get_freeze_filter(
+            freeze_vision=False, freeze_llm=True, freeze_llm_embedder=True, freeze_dual_ae=[False, False]
+        ),
     ),
     # genie sim 3.0 baseline configs
     TrainConfig(

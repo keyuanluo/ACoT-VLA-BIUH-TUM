@@ -11,6 +11,83 @@ import openpi.models.model as _model
 import openpi.transforms as transforms
 
 
+RGB_CAMERA_RENAME_MAP = {
+    "top_head": "base_0_rgb",
+    "hand_left": "left_wrist_0_rgb",
+    "hand_right": "right_wrist_0_rgb",
+}
+
+DEPTH_CAMERA_RENAME_MAP = {
+    "top_head": "base_0_depth",
+    "hand_left": "left_wrist_0_depth",
+    "hand_right": "right_wrist_0_depth",
+}
+
+
+def _to_numpy(array_like):
+    if isinstance(array_like, torch.Tensor):
+        return array_like.cpu().numpy()
+    return np.asarray(array_like)
+
+
+def _parse_rgb_image(image) -> np.ndarray:
+    image = _to_numpy(image)
+    if np.issubdtype(image.dtype, np.floating):
+        image = (255 * image).astype(np.uint8)
+    elif image.dtype != np.uint8:
+        image = image.astype(np.uint8)
+
+    if image.ndim != 3:
+        raise ValueError(f"RGB image must be 3D, got shape {image.shape}")
+    if image.shape[0] == 3:
+        image = np.transpose(image, (1, 2, 0))
+    elif image.shape[-1] != 3:
+        raise ValueError(f"RGB image must have 3 channels, got shape {image.shape}")
+    return image
+
+
+def _parse_depth_image(depth_image) -> np.ndarray:
+    depth_image = _to_numpy(depth_image)
+
+    if depth_image.ndim == 2:
+        depth_image = depth_image[..., None]
+    elif depth_image.ndim == 3:
+        if depth_image.shape[0] == 1:
+            depth_image = np.moveaxis(depth_image, 0, -1)
+        elif depth_image.shape[0] == 3:
+            if not (np.allclose(depth_image[0], depth_image[1]) and np.allclose(depth_image[1], depth_image[2])):
+                raise ValueError(f"Depth image channels differ, got shape {depth_image.shape}")
+            depth_image = np.moveaxis(depth_image[:1], 0, -1)
+        elif depth_image.shape[-1] == 3:
+            if not (np.allclose(depth_image[..., 0], depth_image[..., 1]) and np.allclose(depth_image[..., 1], depth_image[..., 2])):
+                raise ValueError(f"Depth image channels differ, got shape {depth_image.shape}")
+            depth_image = depth_image[..., :1]
+        elif depth_image.shape[-1] != 1:
+            raise ValueError(f"Depth image must be single-channel, got shape {depth_image.shape}")
+    else:
+        raise ValueError(f"Depth image must be 2D or 3D, got shape {depth_image.shape}")
+
+    if depth_image.shape[-1] != 1:
+        raise ValueError(f"Depth image must end with a singleton channel, got shape {depth_image.shape}")
+
+    if np.issubdtype(depth_image.dtype, np.floating):
+        return depth_image.astype(np.float32, copy=False)
+    return depth_image
+
+
+def _parse_camera_group(data: dict, source_key: str, rename_map: dict[str, str], parser) -> dict[str, np.ndarray]:
+    parsed = {}
+    for camera, renamed_camera in rename_map.items():
+        if camera not in data[source_key]:
+            raise ValueError(f"Camera {camera} not found in {source_key}")
+        parsed[renamed_camera] = parser(data[source_key][camera])
+    return parsed
+
+
+def _build_camera_mask(rename_map: dict[str, str]) -> dict[str, np.bool_]:
+    return {renamed_camera: np.True_ for renamed_camera in rename_map.values()}
+
+
 @dataclasses.dataclass(frozen=True)
 class Go2Inputs(transforms.DataTransformFn):
     """Inputs for the Go2 policy.
@@ -24,13 +101,11 @@ class Go2Inputs(transforms.DataTransformFn):
 
     # The expected cameras names. All input cameras must be in this set. Missing cameras will be
     # replaced with black images and the corresponding `image_mask` will be set to False.
-    EXPECTED_CAMERAS: ClassVar[tuple[str, ...]] = ("top_head", "hand_left", "hand_right")
+    EXPECTED_CAMERAS: ClassVar[tuple[str, ...]] = tuple(RGB_CAMERA_RENAME_MAP)
+    EXPECTED_DEPTH_CAMERAS: ClassVar[tuple[str, ...]] = tuple(DEPTH_CAMERA_RENAME_MAP)
 
-    rename_map = {
-        "top_head": "base_0_rgb",
-        "hand_left": "left_wrist_0_rgb",
-        "hand_right": "right_wrist_0_rgb"
-    }
+    rename_map = RGB_CAMERA_RENAME_MAP
+    depth_rename_map = DEPTH_CAMERA_RENAME_MAP
 
     def __call__(self, data: dict) -> dict:
 
@@ -44,26 +119,8 @@ class Go2Inputs(transforms.DataTransformFn):
         # Ensure state has correct shape [batch_size, state_dim]
         state = state.squeeze()
 
-        # Parse images to uint8 (H,W,C) since LeRobot automatically stores as float32 (C,H,W)
-        images = {}
-        for camera in self.EXPECTED_CAMERAS:
-            if camera in data["images"]:
-                img = data["images"][camera]
-                # Convert torch tensor to numpy array if needed
-                if isinstance(img, torch.Tensor):
-                    img = img.cpu().numpy()
-                # Ensure image is in uint8 format
-                if np.issubdtype(img.dtype, np.floating):
-                    img = (255 * img).astype(np.uint8)
-                # Convert from [C,H,W] to [H,W,C] if needed
-                if img.shape[0] == 3:
-                    img = np.transpose(img, (1, 2, 0))
-                images[self.rename_map[camera]] = img
-            else:
-                raise ValueError(f"Camera {camera} not found in data")
-
-        # Create image mask based on available cameras
-        image_mask = {self.rename_map[camera]: np.True_ for camera in self.EXPECTED_CAMERAS}
+        images = _parse_camera_group(data, "images", self.rename_map, _parse_rgb_image)
+        image_mask = _build_camera_mask(self.rename_map)
 
 
         # Prepare inputs dictionary
@@ -72,6 +129,11 @@ class Go2Inputs(transforms.DataTransformFn):
             "image_mask": image_mask,
             "state": state,
         }
+
+        if "depth_images" in data:
+            depth_images = _parse_camera_group(data, "depth_images", self.depth_rename_map, _parse_depth_image)
+            inputs["depth_image"] = depth_images
+            inputs["depth_image_mask"] = _build_camera_mask(self.depth_rename_map)
 
         # Add actions if present
         if "actions" in data:
@@ -110,13 +172,11 @@ class Go2ACOTInputs(transforms.DataTransformFn):
     action_mask: np.ndarray | None = None
     prompt_map_inject_to_training: dict[str, str] | None = None
 
-    EXPECTED_CAMERAS: ClassVar[tuple[str, ...]] = ("top_head", "hand_left", "hand_right")
+    EXPECTED_CAMERAS: ClassVar[tuple[str, ...]] = tuple(RGB_CAMERA_RENAME_MAP)
+    EXPECTED_DEPTH_CAMERAS: ClassVar[tuple[str, ...]] = tuple(DEPTH_CAMERA_RENAME_MAP)
 
-    rename_map = {
-        "top_head": "base_0_rgb",
-        "hand_left": "left_wrist_0_rgb",
-        "hand_right": "right_wrist_0_rgb"
-    }
+    rename_map = RGB_CAMERA_RENAME_MAP
+    depth_rename_map = DEPTH_CAMERA_RENAME_MAP
     acot_action_generation: Sequence[Sequence[int]] | None = None
 
     def slice_state_and_action(self, data):
@@ -181,23 +241,8 @@ class Go2ACOTInputs(transforms.DataTransformFn):
         if self.state_mask is not None:
             state[np.array(self.state_mask)] = 0
 
-        # Parse images to uint8 (H,W,C) since LeRobot automatically stores as float32 (C,H,W)
-        images = {}
-        for camera in self.EXPECTED_CAMERAS:
-            if camera in data["images"]:
-                img = data["images"][camera]
-                if isinstance(img, torch.Tensor):
-                    img = img.cpu().numpy()
-                if np.issubdtype(img.dtype, np.floating):
-                    img = (255 * img).astype(np.uint8)
-                if img.shape[0] == 3:
-                    img = np.transpose(img, (1, 2, 0))
-                images[self.rename_map[camera]] = img
-            else:
-                raise ValueError(f"Camera {camera} not found in data")
-
-        # Create image mask based on available cameras
-        image_mask = {self.rename_map[camera]: np.True_ for camera in self.EXPECTED_CAMERAS}
+        images = _parse_camera_group(data, "images", self.rename_map, _parse_rgb_image)
+        image_mask = _build_camera_mask(self.rename_map)
 
         # Prepare inputs dictionary
         inputs = {
@@ -205,6 +250,11 @@ class Go2ACOTInputs(transforms.DataTransformFn):
             "image_mask": image_mask,
             "state": state,
         }
+
+        if "depth_images" in data:
+            depth_images = _parse_camera_group(data, "depth_images", self.depth_rename_map, _parse_depth_image)
+            inputs["depth_image"] = depth_images
+            inputs["depth_image_mask"] = _build_camera_mask(self.depth_rename_map)
 
         if self.acot_action_generation is not None and "actions" in data:
             action_horizons = self.acot_action_generation[0]
